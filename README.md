@@ -2,7 +2,7 @@
 
 A version of `RealSim` tailored to the Canada-France Imaging Survey (CFIS).
 
-First get a  `CANFAR` account and then install the Canadian Astronomy Data Center (CADC) `vos` collection of packages/tools. I installed it in a conda environment and dumped it to `cfis.yml` if you want to use the same environment that I used (recommended, so that I can debug for you). Otherwise, `vos` can be installed via `pip`:
+To access CFIS images, you must have a `CANFAR` account and the `vos` collection. First get a  `CANFAR` account and then install the Canadian Astronomy Data Center (CADC) `vos` collection of packages/tools. I installed it in a conda environment and dumped it to `cfis.yml` if you want to use the same environment that I used (recommended, so that I can debug for you). Otherwise, `vos` can be installed via `pip`:
 
     pip install -U vos
     
