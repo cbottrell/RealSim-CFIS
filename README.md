@@ -6,7 +6,7 @@ First get a  `CANFAR` account and then install the Canadian Astronomy Data Cente
 
     pip install -U vos
     
-or by following any of the instructions here: https://pypi.org/project/vos/
+or by following any of the instructions here: https://pypi.org/project/vos/. With `vos` you will have to use the `getCert` tool every two weeks to renew your certificate. You just need your `CANFAR` username and password.
 
 ### Compatibility
 Tested with Python 3 only. Tested with `Python 3.6.3`. `vos` is currently not compatible with `Python 3.7.x`.
