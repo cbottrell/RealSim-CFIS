@@ -1,167 +1,192 @@
 #!/bin/env python
 
 '''
-The statistical observational realism suite presented in Bottrell et al 2019b. If you use this suite in your research or for any other purpose, I would appreciate a citation. If you have questions or suggestions on how to improve or broaden the suite, please contact me at cbottrel "at" uvic "dot" ca.
-
-Version 0.3
-
-Update History:
-(v0_1) - February-2016 Correction to the way that the poisson noise is handled. Changed incorrect float padding to a sampling of a true Poisson distribution with correct implementation of the Gain quantity. SkyServer 'sky' and 'skysig' quantities are added to the header keywords when using real SDSS images.
-(v0_2) - January-2019 Spec2SDSS_gri now incorporates the redshift (factor of (1+z)**5) to the wavelength specific intensities when generating the bandpass AB surface brightnesses. The redshift factor is now removed from intensity scaling step in this version.
-(v0_3) - January-2019 Computes ra,dec from the source mask when determining image position. This avoids image registration offsets in row and column numbers for each band. Prepared for public release.
+The statistical observational realism suite presented in Bottrell et al 2019b applied to the CFIS survey. If you use this suite in your research or for any other purpose, I would appreciate a citation. If you have questions or suggestions on how to improve or broaden the suite, please contact me at cbottrel "at" uvic "dot" ca.
 '''
 
 import numpy as np
-import os,sys,string,time
+import os,sys,string,time,random
+from rebin import rebin
 import scipy.interpolate
 import scipy.ndimage
 import warnings
 from astropy.io import fits
+from astropy.wcs import WCS
 from astropy.utils.exceptions import AstropyWarning
 from astropy.convolution import Gaussian2DKernel
 from astropy.convolution import convolve
 from astropy.cosmology import FlatLambdaCDM
+import sep
+sep.set_extract_pixstack(9999999)
+from vos import vos
 
+# RealSimCFIS base directory (should be part of `self` if class)
+RSDIR = '/Users/cbottrell/Project/RealSimCFIS/'
 
-def rebin(array, dimensions=None, scale=None):
-    """
-    Return the array 'array' to the new 'dimensions'
-    conserving the flux in the bins. The sum of the
-    array will remain the same as the original array.
-    Congrid from the scipy recipies does not generally
-    conserve surface brightness with reasonable accuracy.
-    As such, even accounting for the ratio of old and new
-    image areas, it does not conserve flux. This function
-    nicely solves the problem and more accurately
-    redistributes the flux in the output. This function
-    conserves FLUX so input arrays in surface brightness
-    will need to use the ratio of the input and output
-    image areas to go back to surface brightness units.
-    
-    EXAMPLE
-    -------
-    
-    In [0]:
-    
-    # input (1,4) array (sum of 6)
-    y = np.array([0,2,1,3]).reshape(1,4).astype(float)
-    # rebin to (1,3) array
-    yy = rebin(y,dimensions=(1,3))
-    print yy
-    print np.sum(yy)
-    
-    Out [0]:
-    
-    Rebinning to Dimensions: 1, 3
-    [[0.66666667 2.         3.33333333]]
-    6.0
+def getInfo_SQL():
+    '''Grab object and tile info from database.'''
+    import pymysql
+    cnf_path = '/Users/cbottrell/.mysql/lauca.cnf'
+    db = pymysql.connect(host='lauca.phys.uvic.ca',
+                         user='cbottrell',
+                         database='sdss',
+                         read_default_file=cnf_path)
+    c = db.cursor()
+    dbcmd = ['SELECT objID,ra,decl,CFIS_tile',
+             'FROM dr7_uberuber',
+             'WHERE in_CFIS_May2019=1']
+    c.execute(' '.join(dbcmd))
+    data = np.asarray(c.fetchall())
+    c.close()
+    db.close()
+    objIDs = data[:,0].astype(int)
+    ras = data[:,1].astype(float)
+    decs = data[:,2].astype(float)
+    tiles = data[:,3]
+    return objIDs,ras,decs,tiles
 
-    RAISES
-    ------
-    AssertionError
-        If the totals of the input and result array don't
-        agree, raise an error because computation may have
-        gone wrong.
-        
-    Copyright: Martyn Bristow (2015) and licensed under GPL v3:
-    i.e. free to use/edit but no warranty.
-    """
-    if dimensions is not None:
-        if isinstance(dimensions, float):
-            dimensions = [int(dimensions)] * len(array.shape)
-        elif isinstance(dimensions, int):
-            dimensions = [dimensions] * len(array.shape)
-        elif len(dimensions) != len(array.shape):
-            raise RuntimeError('')
-    elif scale is not None:
-        if isinstance(scale, float) or isinstance(scale, int):
-            dimensions = map(int, map(round, map(lambda x: x*scale, array.shape)))
-        elif len(scale) != len(array.shape):
-            raise RuntimeError('')
+def getInfo_File():
+    '''Grab object and info from npy file.'''
+    catName = RSDIR+'/Sources/Catalogues/CFIS-DR7_fieldInfo.npy'
+    objIDs,ras,decs,tiles = np.load(catName)
+    objIDs = objIDs.astype(int)
+    ras = ras.astype(float)
+    decs = decs.astype(float)
+    return objIDs,ras,decs,tiles
+
+def genCFIS_argList(use_sql=False):
+    '''Generate CFIS argument list.'''
+    if use_sql:
+        objIDs,ras,decs,tiles = getInfo_SQL()
     else:
-        raise RuntimeError('Incorrect parameters to rebin.\n\trebin(array, dimensions=(x,y))\n\trebin(array, scale=a')
-    #print "Rebinning to Dimensions: %s, %s" % tuple(dimensions)
-    import itertools
-    dY, dX = map(divmod, map(float, array.shape), dimensions)
- 
-    result = np.zeros(dimensions)
-    for j, i in itertools.product(*map(range, array.shape)):
-        (J, dj), (I, di) = divmod(j*dimensions[0], array.shape[0]), divmod(i*dimensions[1], array.shape[1])
-        (J1, dj1), (I1, di1) = divmod(j+1, array.shape[0]/float(dimensions[0])), divmod(i+1, array.shape[1]/float(dimensions[1]))
-        
-        # Moving to new bin
-        # Is this a discrete bin?
-        dx,dy=0,0
-        if (I1-I == 0) | ((I1-I == 1) & (di1==0)):
-            dx = 1
-        else:
-            dx=1-di1
-        if (J1-J == 0) | ((J1-J == 1) & (dj1==0)):
-            dy=1
-        else:
-            dy=1-dj1
-        # Prevent it from allocating outide the array
-        I_=min(dimensions[1]-1,I+1)
-        J_=min(dimensions[0]-1,J+1)
-        result[J, I] += array[j,i]*dx*dy
-        result[J_, I] += array[j,i]*(1-dy)*dx
-        result[J, I_] += array[j,i]*dy*(1-dx)
-        result[J_, I_] += array[j,i]*(1-dx)*(1-dy)
-    allowError = 0.1
-    assert (array.sum() < result.sum() * (1+allowError)) & (array.sum() >result.sum() * (1-allowError))
-    return result
-    
-def ObsRealism(inputName,outputName,band='r',
-                cosmo=FlatLambdaCDM(H0=70,Om0=0.3),
-                common_args = { 
-                                'redshift'      : 0.1,   # mock observation redshift
-                                'rebin_to_CCD'  : False, # rebin to CCD angular scale
-                                'CCD_scale'     : 0.396, # CCD angular scale in [arcsec/pixel]
-                                'add_false_sky' : False, # add gaussian sky
-                                'false_sky_sig' : 24.2,  # gaussian sky standard dev [AB mag/arcsec2]
-                                'add_false_psf' : False, # convolve with gaussian psf
-                                'false_psf_fwhm': 1.0,   # gaussian psf FWHM [arcsec]
-                                'add_poisson'   : False, # add poisson noise to galaxy
-                                'add_sdss_sky'  : False, # insert into real SDSS sky (using sdss_args)
-                                'add_sdss_psf'  : False, # convolve with real SDSS psf (using sdss_args)
+        objIDs,ras,decs,tiles = getInfo_File()
+    return list(zip(ras,decs,tiles))
 
-                              },
-               sdss_args    = {
-                                'sdss_run'      : 745,       # sdss run
-                                'sdss_rerun'    : 40,        # sdss rerun
-                                'sdss_camcol'   : 1,         # sdss camcol
-                                'sdss_field'    : 517,       # sdss field
-                                'sdss_ra'       : 236.1900,  # ra for image centroid
-                                'sdss_dec'      : -0.9200,   # ec for image centroid
-                              }
-               ):
+def getCutoutImage(ra,dec,tile,hw=1750):
+    '''Get a large cutout of CFIS tile. Input images are 10000x10000.
+    This function makes an (11 arcmin x 11 arcmin) of the CFIS tile. 
+    It finds the (row,col) position of the target objID using ra,dec (degrees).
+    It then checks for boundary conditions on the cutout region and adapts.
+    The final cutout is 3501x3501 pixels, not always centered on the target.
+    `hw` is the half-width of the cutout size. Returns cutout filename.'''
+    warnings.filterwarnings('ignore')
+    client = vos.Client()
+    wcsName = 'WCS-{}'.format(tile)
+    cutoutName = 'Cutout-{}'.format(tile)
+    # get wcs file
+    while not os.access(wcsName,0):
+        try:
+            client.copy(source='vos:cfis/tiles_DR2/{}[1:2,1:2]'.format(tile),
+                        destination=wcsName)
+        except:
+            time.sleep(10)
+    # get wcs mapping
+    wcs = WCS(wcsName)
+    # determine column and row position in image
+    colc,rowc = wcs.all_world2pix(ra,dec,1,ra_dec_order=True)
+    # convert to integers
+    colc,rowc = int(np.around(colc)),int(np.around(rowc))
+    # remove temporary file
+    if os.access(wcsName,0): os.remove(wcsName)
+    # get boundaries
+    if colc - hw < 1:
+        colc_m = 1
+        colc_p = 2*hw+1
+    elif colc + hw > 10000:
+        colc_m = 10000-(2*hw)
+        colc_p = 10000
+    else:
+        colc_m = colc-hw
+        colc_p = colc+hw
+    if rowc - hw < 1:
+        rowc_m = 1
+        rowc_p = 2*hw+1
+    elif rowc + hw > 10000:
+        rowc_p = 10000
+        rowc_m = 10000-(2*hw)
+    else:
+        rowc_m = rowc-hw
+        rowc_p = rowc+hw
+    # get full file
+    while not os.access(cutoutName,0):
+        try:
+            client.copy(source='vos:cfis/tiles_DR2/{}[{}:{},{}:{}]'.format(tile,colc_m,colc_p,rowc_m,rowc_p),
+                        destination=cutoutName)
+        except:
+            time.sleep(10)
+    return cutoutName
+
+def genSegmap(cutoutName):
+    '''Create segmenation image using the sep SExtractor module.'''
+    cutoutData = fits.getdata(cutoutName)
+    # filter kernel
+    filter_kernel = np.loadtxt('{}Sources/utils/CFIS-cfg/gauss_3.0_7x7.conv'.format(RSDIR),skiprows=2)
+    # use std of full image as detection threshold
+    guess_rms = np.std(cutoutData)
+    # mask all sources above std for background statistics
+    mask = (cutoutData>guess_rms)
+    # https://github.com/kbarbary/sep/issues/23
+    cutoutData_sw = cutoutData.byteswap(True).newbyteorder()
+    # bkg object which includes sky() and rms() methods
+    bkg = sep.Background(cutoutData_sw, mask=mask, bw=32, bh=32, fw=3, fh=3)
+    # run sep.extract() on image
+    objCat,segmap = sep.extract(cutoutData_sw, thresh=1.0, err=bkg.rms(), mask=None, minarea=5,
+                             filter_kernel=filter_kernel,filter_type='conv',deblend_nthresh=32,
+                             deblend_cont=0.001, clean=True,clean_param=1.0, segmentation_map=True)
+    return segmap
+    
+def getInjectCoords(segmap):
+    '''Use segmentation image to find injection coordinates.
+    There is a 10% boundary from the cutout edges which are forbidden.
+    A pixels that is both a sky pixel and is inside the boundary is eligible.'''
+    # always square cutouts
+    size = segmap.shape[0]
+    # background pixels
+    bkgmap = (segmap == 0)
+    # pixels within 10% of image size from either side
+    bordermap = np.zeros(segmap.shape)
+    bordermap[int(0.1*size):int(0.9*size),int(0.1*size):int(0.9*size)]=1
+    # map of possible injection sites
+    segmap = bordermap*bkgmap
+    # index of injection site for map
+    index = np.random.choice(int(np.sum(segmap)))
+    # coordinates of injection site 
+    return np.argwhere(segmap)[index]
+
+def RealSim_CFIS(inputName,outputName,
+                 cosmo=FlatLambdaCDM(H0=70,Om0=0.3), # cosmology
+                 redshift       = 0.05,   # mock observation redshift
+                 apply_dimming  = False,  # apply redshift dimming 
+                 rebin_to_CCD   = True,   # rebin to CCD angular scale
+                 CCD_scale      = 0.187,  # CCD angular scale in [arcsec/pixel]
+                 add_false_sky  = False,  # add gaussian sky
+                 false_sky_sig  = 24.2,   # gaussian sky standard dev [AB mag/arcsec2]
+                 add_false_psf  = True,   # convolve with gaussian psf
+                 false_psf_fwhm = 0.6,    # gaussian psf FWHM [arcsec]
+                 add_poisson    = False,  # add poisson noise to galaxy
+                 add_cfis_sky   = True,   # insert into real CFIS sky (using sdss_args)
+                ):
     
     '''
-    Add realism to idealized unscaled image.
+    Keyword description.
     
-    "redshift": The redshift at which the synthetic image is to be mock-observed. Given that the image should be in surface brightness units and appropriately dimmed by (1+z)^-5, the redshift is only used to determine the angular-to-physical scale of the image -- to which it is appropriately rebinned corresponding to the desired CCD pixel scale.
-    
-    "rebin_to_CCD": If TRUE, the image is rebinned to the CCD scale identified by the "CCD_scale" keyword. The rebinning is determined by first computing the physical-to-angular scale associated with the target redshift [kpc/arcsec]. Combining this number with the scale of the original image in physical units [kpc/pixel], we obtain the rebinning factor that is neccesary to bring the image to the desired CCD pixel scale [arcsec/pixel].
-    
-    "CCD_scale": The CCD scale to which the images are rebinned if rebin_to_CCD is TRUE.
-    
-    "add_false_sky": If TRUE, a Gaussian sky is added to the image with a noise level that is idenfitied by the "false_sky_sig" keyword.
-    
-    "false_sky_sig": The standard deviation of Gaussian sky that is added to the image if "add_false_sky" is TRUE. The value must be expressed in relative magnitude units (AB mag/arcsec2).
-    
-    "add_false_psf": If TRUE, a Gaussian PSF is added to the image with a FWHM that is idenfitied by the "false_psf_fwhm" keyword.
-    
-    "false_psf_fwhm": The FWHM of the PSF that is convolved with the image if "add_false_psf" is TRUE. The value must be expressed in arcsec.
-    
-    "add_poisson": If TRUE, add Poisson noise to the image using either the calibration info and gain from the real image properties ("add_sdss_sky"=TRUE) or generic values derived from averages over SDSS fields.
-    
-    "add_sdss_sky": If True, insert into real SDSS sky using arguments in "sdss_args".
-    
-    "add_sdss_psf": If True and "add_sdss_sky"=True, reconstruct the PSF at the injection location and convolve with the image.
+    `inputName` -- File path for single-band idealized FITS image [mag/arcsec2]
+    `outputName` -- File path for FITS output [nanomaggies].
+    `cosmo` -- cosmology.
+    `redshift` -- Target redshift of image in the survey. Used to compute dimming (optional) and
+    the angular size of the image for a given physical size.
+    `apply_dimming` -- Apply (1+z)**-5 surface brightness dimming from redshift.
+    `rebin_to_CCD` -- If True, rebins the image to the target angular size and pixel scale. If False,
+    the output image is the same dimensions as the input.
+    `add false_sky` -- Add gaussian sky to the image.
+    `false_sky_sig` -- Standard deviation in the sky brightness, expressed in AB mag/arcsec2
+    `add_false_psf` -- Convolve with a gaussian PSF.
+    `false_psf_fwhm` -- fwhm of the gaussian PSF in arcseconds.
+    `add_poisson` -- Add Poisson shot noise to to the source flux after convolution. This currently
+    does not work with CFIS images because we don't know what the GAIN is.
+    `add_cfis_sky` -- if True, insert image into a real CFIS FOV.
     '''
-    
-    # mock observation redshift
-    redshift = common_args['redshift']
+
     # speed of light [m/s]
     speed_of_light = 2.99792458e8
     # kiloparsec per arcsecond scale
@@ -175,19 +200,7 @@ def ObsRealism(inputName,outputName,band='r',
         header = hdul[0].header
         # img data
         img_data = hdul[0].data
-    
-#    # header properties
-#    sim_tag = header['SIMTAG']
-#    sub_tag = header['SUBTAG']
-#    isnap = header['ISNAP']
-#    axis = header['CAMERA']
-#    band = header['FILTER'][0]
-#
-#    # unique simulID
-#    simulID = '{}-{}-{}-{}'.format(sim_tag,sub_tag,isnap,axis)
-#
-#    band = header['FILTER'][0]
-
+        
     # collect physical pixel scale
     kpc_per_pixel = header['CDELT1']/1000. # [kpc/pixel]
     # compute angular pixel scale from cosmology
@@ -195,28 +208,21 @@ def ObsRealism(inputName,outputName,band='r',
      
     # img in AB nanomaggies per arcsec2
     img_nanomaggies = 10**(-0.4*(img_data-22.5)) # [nmgys/arcsec2]
+    # if not already dimmed, apply here
+    if apply_dimming:
+        img_nanomaggies*=(1+redshift)**(-5)
     # apply pixel scale [arcsec/pixel]2 to convert to calibrated flux
     img_nanomaggies *= arcsec_per_pixel**2 # [nmgs]
     # update units of image header to linear calibrated scale
     header['BUNIT'] = 'AB nanomaggies'
     
-#    print('\nRaw image:')
-#    print('kpc_per_arcsec: {}'.format(kpc_per_arcsec))
-#    print('kpc_per_pixel: {}'.format(kpc_per_pixel))
-#    print('arcsec_per_pixel: {}'.format(arcsec_per_pixel))
-#    m_AB = -2.5*np.log10(np.sum(img_nanomaggies))+22.5
-#    print('AB_magnitude: {} at z={}'.format(m_AB,redshift))
-#    M_AB = m_AB-5*np.log10(luminosity_distance.value)-25
-#    print('AB_Magnitude: {}'.format(M_AB))
-
     # Add levels of realism
-    
-    if common_args['rebin_to_CCD']:
+    if rebin_to_CCD:
         '''
         Rebin image to a given angular CCD scale
         '''
         # telescope ccd angular scale
-        ccd_scale = common_args['CCD_scale']
+        ccd_scale = CCD_scale
         # axes of original image
         nPixelsOld = img_nanomaggies.shape[0]
         # axes of regridded image
@@ -234,27 +240,19 @@ def ObsRealism(inputName,outputName,band='r',
         header['CRPIX2'] = CRPIX
         header['CDELT1'] = kpc_per_pixel*1000
         header['CDELT2'] = kpc_per_pixel*1000
-#        print('\nAfter CCD scaling:')
-#        print('kpc_per_arcsec: {}'.format(kpc_per_arcsec))
-#        print('kpc_per_pixel: {}'.format(kpc_per_pixel))
-#        print('arcsec_per_pixel: {}'.format(arcsec_per_pixel))
-#        m_AB = -2.5*np.log10(np.sum(img_nanomaggies))+22.5
-#        print('AB_magnitude: {} at z={}'.format(m_AB,redshift))
-#        M_AB = m_AB-5*np.log10(luminosity_distance.value)-25
-#        print('AB_Magnitude: {}'.format(M_AB))
-
+        
     # convolve with gaussian psf
-    if common_args['add_false_psf']:
+    if add_false_psf:
         '''
         Add Gaussian PSF to image with provided FWHM in
         arcseconds.
         '''
-        std = common_args['false_psf_fwhm']/arcsec_per_pixel/2.355
-        kernel = Gaussian2DKernel(stddev=std)
+        std = false_psf_fwhm/arcsec_per_pixel/2.355
+        kernel = Gaussian2DKernel(x_stddev=std,y_stddev=std)
         img_nanomaggies = convolve(img_nanomaggies, kernel)
         
-    # add poisson noise to image
-    if common_args['add_poisson'] and not common_args['add_sdss_sky']:
+        # add poisson noise to image
+    if add_poisson and not add_cfis_sky:
         '''
         Add shot noise to image assuming the average SDSS
         field properties for zeropoint, airmass, atmospheric
@@ -265,16 +263,9 @@ def ObsRealism(inputName,outputName,band='r',
         is the square root of the number of counts in each 
         pixel.
         
-        For details on the methods applied here, see:
-        http://classic.sdss.org/dr7/algorithms/fluxcal.html
-        
-        Average quantites obtained from SkyServer SQL form.
-        http://skyserver.sdss.org/dr7/en/tools/search/sql.asp
-        DR7 Query Form:
-        SELECT AVG(airmass_x),AVG(aa_x),AVG(kk_x),AVG(gain_x)
-        FROM Field
+        !!! Needs change for CFIS.
         '''
-        # average sdss photometric field properties (gain is inverse gain)
+        # !!! average CFIS photometric field properties (gain is inverse gain)
         airmass  = {'u':1.178, 'g':1.178, 'r':1.177, 'i':1.177, 'z':1.178}
         aa       = {'u':-23.80,'g':-24.44,'r':-24.03,'i':-23.67,'z':-21.98}
         kk       = {'u':0.5082,'g':0.1898,'r':0.1032,'i':0.0612,'z':0.0587}
@@ -290,7 +281,7 @@ def ObsRealism(inputName,outputName,band='r',
         img_nanomaggies = img_counts / counts_per_nanomaggy
         
     # add gaussian sky to image
-    if common_args['add_false_sky']:
+    if add_false_sky:
         '''
         Add sky with noise level set by "false_sky_sig" 
         keyword. "false_sky_sig" should be in relative  
@@ -299,8 +290,6 @@ def ObsRealism(inputName,outputName,band='r',
         standard deviation in the sky in linear flux units
         [maggies/arcsec2] around a sky level of zero.
         '''
-        # sky sig in AB mag/arcsec2
-        false_sky_sig = common_args['false_sky_sig']
         # conversion from mag/arcsec2 to nanomaggies/arcsec2
         false_sky_sig = 10**(0.4*(22.5-false_sky_sig))
         # account for pixel scale in final image
@@ -309,142 +298,48 @@ def ObsRealism(inputName,outputName,band='r',
         sky = false_sky_sig*np.random.randn(*img_nanomaggies.shape)
         # add false sky to image in nanomaggies
         img_nanomaggies += sky
-    
-    # add image to real sdss sky
-    if common_args['add_sdss_sky']:
-        '''
-        Extract field from galaxy survey database using
-        effectively weighted by the number of galaxies in
-        each field. For this to work, the desired field
-        mask should already have been generated and the
-        insertion location selected.
-        '''
-        import sqlcl
-        from astropy.wcs import WCS
-        run    = sdss_args['sdss_run']
-        rerun  = sdss_args['sdss_rerun']
-        camcol = sdss_args['sdss_camcol']
-        field  = sdss_args['sdss_field']
-        ra     = sdss_args['sdss_ra']
-        dec    = sdss_args['sdss_dec']
-        exptime = 53.907456 # seconds
+        header.append(('SKY',0.0,'Average sky in full CFIS tile [nanomaggies]'),end=True)
+        header.append(('SKYSIG',false_sky_sig,'Average sky uncertainty per pixel [nanomaggies]'),end=True)
         
-        # sdss data archive server
-        das_url = 'http://das.sdss.org/'
-    
-        # get and uzip corrected image
-        corr_url = das_url+'imaging/{}/{}/corr/{}/'.format(run,rerun,camcol)
-        corr_image_name = 'fpC-{:06}-{}{}-{:04}.fit'.format(run,band,camcol,field)
-        if not os.access(corr_image_name,0):
-            corr_url+='{}.gz'.format(corr_image_name)
-            os.system('wget {}'.format(corr_url))
-            os.system('gunzip {}'.format(corr_image_name))
-        # get wcs mapping
-        w = WCS(corr_image_name)
-        # determine column and row position in image
-        colc,rowc = w.all_world2pix(ra,dec,1,ra_dec_order=True)
-        # convert to integers
-        colc,rowc = int(np.around(colc)),int(np.around(rowc))
+    if add_cfis_sky:
+        cfis_argList = genCFIS_argList(use_sql=False)
+        ra,dec,tile = random.choice(cfis_argList)
+        cutoutName = getCutoutImage(ra,dec,tile)
+        # cutout data, converted from counts/s (AB zeropoint=30) to nanomaggies
+        cutoutData = fits.getdata(cutoutName)*10**(-0.4*(30-22.5))
+        # segmentation map
+        segMap = genSegmap(cutoutName)
+        # injection coords
+        colc,rowc = getInjectCoords(segMap)
         
-        # get field properties from skyServer
-        dbcmd = ['SELECT aa_{b},kk_{b},airmass_{b},gain_{b},sky_{b},skysig_{b}'.format(b=band),
-                 'FROM Field where run={} AND rerun={}'.format(run,rerun),
-                 'AND camcol={} AND field={}'.format(camcol,field)]
-        lines = sqlcl.query(' '.join(dbcmd)).readlines()
-        # zeropoint, atmospheric extinction, airmass, inverse gain, sky, sky uncertainty
-        aa,kk,airmass,gain,sky,skysig = [float(var) for var in lines[1].decode("utf-8").split('\n')[0].split(',')]
-        #print(aa,kk,airmass,gain,sky,skysig)
-        # convert sky to nanomaggies from maggies/arcsec2
-        sky *= (1e9*0.396127**2)
-        # convert skysig to nanomaggies from relative sky magnitude errors
-        skysig *= sky*np.log(10)/2.5
-        # software bias added to corrected images to avoid negative values
-        softbias = float(fits.getheader(corr_image_name)['SOFTBIAS'])
-        # subtract softbias from corrected image to get image in DN
-        corr_image_data = fits.getdata(corr_image_name).astype(float) - softbias # [counts]
-        # conversion from nanomaggies to counts
-        counts_per_nanomaggy = exptime*10**(-0.4*(22.5+aa+kk*airmass))
-        # convert image in counts to nanomaggies with Field properties
-        corr_image_data /= counts_per_nanomaggy # [nanomaggies]
-        
-        if common_args['add_sdss_psf'] and not common_args['add_false_psf']:
-            '''
-            Grab, reconstruct, and convolve real SDSS PSF image
-            with the image in nanomaggies.
-            '''
-            # get corresponding psf reconstruction image
-            psf_url = das_url+'imaging/{}/{}/objcs/{}/'.format(run,rerun,camcol)
-            psf_image_name = 'psField-{:06}-{}-{:04}.fit'.format(run,camcol,field)
-            if os.access(psf_image_name,0):os.remove(psf_image_name)
-            psf_url+=psf_image_name
-            os.system('wget {}'.format(psf_url))
-            psf_ext = {'u':1,'g':2,'r':3,'i':4,'z':5}
-            psfname = 'sdss_psf.fit'
-            os.system('Sources/utils/sdss-apps/readAtlasImages-v5_4_11/read_PSF {} {} {} {} {}'.format(psf_image_name,psf_ext[band],rowc,colc,psfname))
-            if os.access(psf_image_name,0): os.remove(psf_image_name)
-            # remove softbias from PSF 
-            psfdata = fits.getdata(psfname).astype(float)-1000.
-            # normalize for convolution with image in nanomaggies
-            psfdata /= np.sum(psfdata)
-            # convolve with image in nanomaggies
-            img_nanomaggies = convolve(img_nanomaggies,psfdata)
-            if os.access(psfname,0):os.remove(psfname)
-        
-        if common_args['add_poisson']:
-            '''
-            Add Poisson noise to the PSF-convolved image
-            with noise level corresponding to the real SDSS
-            field properties.
-            '''
-            # image in counts for given field properties
-            img_counts = np.clip(img_nanomaggies * counts_per_nanomaggy,a_min=0,a_max=None)
-            # poisson noise [adu] computed accounting for gain [e/adu]
-            img_counts = np.random.poisson(lam=img_counts*gain)/gain
-            # convert back to nanomaggies
-            img_nanomaggies = img_counts / counts_per_nanomaggy
-            
         # add real sky pixel by pixel to image in nanomaggies
-        corr_ny,corr_nx = corr_image_data.shape
+        corr_ny,corr_nx = cutoutData.shape
         ny,nx = img_nanomaggies.shape
         for xx in range(nx):
             for yy in range(ny):
                 corr_x = int(colc - nx/2 + xx)
                 corr_y = int(rowc - ny/2 + yy)
                 if corr_x>=0 and corr_x<=corr_nx-1 and corr_y>=0 and corr_y<=corr_ny-1:
-                    img_nanomaggies[yy,xx]+=corr_image_data[corr_y,corr_x]
-        if os.access(corr_image_name,0):os.remove(corr_image_name)
-        
+                    img_nanomaggies[yy,xx]+=cutoutData[corr_y,corr_x]
+                else:
+                    img_nanomaggies[yy,xx]=0.
+        if os.access(cutoutName,0):os.remove(cutoutName)
         # add field info to image header
         warnings.simplefilter('ignore', category=AstropyWarning)            
-        header.append(('RUN',run,'SDSS image RUN'),end=True)
-        header.append(('RERUN',rerun,'SDSS image RERUN'),end=True)
-        header.append(('CAMCOL',camcol,'SDSS image CAMCOL'),end=True)
-        header.append(('FIELD',field,'SDSS image FIELD'),end=True)
+        header.append(('TILE',tile,'CFIS tile ID'),end=True)
         header.append(('RA',float(ra),'Cutout centroid RA'),end=True)
         header.append(('DEC',float(dec),'Cutout centroid DEC'),end=True)
-        header.append(('COLC',colc,'SDSS image column center'),end=True)
-        header.append(('ROWC',rowc,'SDSS image row center'),end=True)
-        header.append(('GAIN',gain,'SDSS CCD GAIN'),end=True)
-        header.append(('ZERO',aa,'SDSS image zeropoint'),end=True)
-        header.append(('EXTC',kk,'SDSS image atm. extinction coefficient'),end=True)
-        header.append(('AIRM',airmass,'SDSS image airmass'),end=True)
-        header.append(('SKY',sky,'Average sky in full SDSS field [nanomaggies]'),end=True)
-        header.append(('SKYSIG',skysig,'Average sky uncertainty per pixel [nanomaggies]'),end=True)
-            
-    gimage = outputName
-    if os.access(gimage,0): os.remove(gimage)
+        header.append(('COLC',colc,'CFIS tile column center'),end=True)
+        header.append(('ROWC',rowc,'CFIS tile row center'),end=True)
+        header.append(('GAIN','N/A','CFIS CCD GAIN'),end=True)
+        header.append(('ZERO',30.0,'CFIS image zeropoint'),end=True)
+        header.append(('EXTC','N/A','CFIS image atm. extinction coefficient'),end=True)
+        header.append(('AIRM','N/A','CFIS image airmass'),end=True)
+        header.append(('SKY',-999,'Average sky in full CFIS tile [nanomaggies]'),end=True)
+        header.append(('SKYSIG',-999,'Average sky uncertainty per pixel [nanomaggies]'),end=True)
         
-#    print('\nAfter Realism:')
-#    print('kpc_per_arcsec: {}'.format(kpc_per_arcsec))
-#    print('kpc_per_pixel: {}'.format(kpc_per_pixel))
-#    print('arcsec_per_pixel: {}'.format(arcsec_per_pixel))
-#    m_AB = -2.5*np.log10(np.sum(img_nanomaggies))+22.5
-#    print('AB_magnitude: {} at z={}'.format(m_AB,redshift))
-#    M_AB = m_AB-5*np.log10(luminosity_distance.value)-25
-#    print('AB_Magnitude: {}'.format(M_AB))
-
+    if os.access(outputName,0): os.remove(outputName)
     hdu_pri = fits.PrimaryHDU(img_nanomaggies)
-
     header['REDSHIFT'] = (redshift,'Redshift')
     header.append(('COSMO','FLAT_LCDM','Cosmology'),end=True)
     header.append(('OMEGA_M',cosmo.Om(0),'Matter density'),end=True)
@@ -454,73 +349,58 @@ def ObsRealism(inputName,outputName,band='r',
     header.append(('SCALE_3',kpc_per_arcsec,'[kpc/arcsec]'),end=True)
     header.append(('LUMDIST',cosmo.luminosity_distance(z=redshift).value,'Luminosity Distance [Mpc]'),end=True)
     warnings.simplefilter('ignore', category=AstropyWarning)
-    header.extend(zip(common_args.keys(),common_args.values()),unique=True)
+    header.append(('apply_dimming', apply_dimming),end=True)
+    header.append(('rebin_to_CCD', rebin_to_CCD),end=True)
+    header.append(('CCD_scale', CCD_scale),end=True)
+    header.append(('add_false_sky', add_false_sky),end=True)
+    header.append(('false_sky_sig ', false_sky_sig),end=True)
+    header.append(('add_false_psf', add_false_psf),end=True)
+    header.append(('false_psf_fwhm', false_psf_fwhm),end=True)
+    header.append(('add_poisson', add_poisson),end=True)
+    header.append(('add_cfis_sky', add_cfis_sky),end=True)
     hdu_pri.header = header
-    hdu_pri.writeto(gimage)
+    hdu_pri.writeto(outputName)
+    
+def worker_wrapper(arg):
+    inputName,outputName,common_args = arg
+    if not os.access(outputName,0):
+        with tempfile.TemporaryDirectory() as path:
+            os.chdir(path)
+            RealSim_CFIS(inputName,outputName,**common_args)
 
+def main(fov_per_image=1):
+    from glob import glob
+    SLURM_CPUS = mp.cpu_count()
+    pool = mp.Pool(1)
+    
+    inputList = list(sorted(glob('{}Inputs/photo_r_CFIS*.fits'.format(RSDIR))))
 
-'''
-Script executions start here. This version grabs a corrected image
-based on a basis set of galaxies from a database, runs source 
-extractor to produce a mask, and selects the location in which to
-place the image in the SDSS sky. The final science cutout includes
-PSF blurring (real SDSS), SDSS sky from the corrected image, and 
-Poisson noise added. The final image is in nanomaggies.
-'''
+    cosmo=FlatLambdaCDM(H0=70,Om0=0.3)
+    common_args = { 
+                'redshift'      : 0.05, # mock observation redshift
+                'apply_dimming' : False, # apply redshift dimming 
+                'rebin_to_CCD'  : True, # rebin to CCD angular scale
+                'CCD_scale'     : 0.187, # CCD angular scale in [arcsec/pixel]
+                'add_false_sky' : False, # add gaussian sky
+                'false_sky_sig' : 24.2,  # gaussian sky standard dev [AB mag/arcsec2]
+                'add_false_psf' : True, # convolve with gaussian psf
+                'false_psf_fwhm': 0.6,   # gaussian psf FWHM [arcsec]
+                'add_poisson'   : False, # add poisson noise to galaxy
+                'add_cfis_sky'  : True, # insert into real CFIS sky (using sdss_args)
+                    }
 
-# get run,rerun,camcol,field,column,row from database data
-def rrcf_radec(field_info):
-    from astropy.wcs import WCS
-    # randomly select from basis set
-    index = np.random.randint(low=0,high=len(field_info)-1)
-    # define run,rerun,camcol,field of target sky
-    run,rerun,camcol,field = field_info[index]
-    # sdss data archive server
-    das_url = 'http://das.sdss.org/'
-    # get and uzip corrected image
-    corr_url = das_url+'imaging/{}/{}/corr/{}/'.format(run,rerun,camcol)
-    corr_image_name = 'fpC-{:06}-r{}-{:04}.fit'.format(run,camcol,field)
-    if not os.access(corr_image_name,0):
-        corr_url+='{}.gz'.format(corr_image_name)
-        os.system('wget {}'.format(corr_url))
-        os.system('gunzip {}'.format(corr_image_name))
-    corr_mask_name = corr_image_name.replace('.fit','_mask.fit')
-    # configuration path (SEx params, gim2d files, etc.)
-    sdss_cfg_path = 'Sources/utils/sdss-cfg/'
-    # run SExtractor to produce mask
-    sexcmd = ['sex {} -c {}sdss.sex'.format(corr_image_name,sdss_cfg_path),
-              '-CHECKIMAGE_NAME {}'.format(corr_mask_name)]
-    os.system(' '.join(sexcmd))
-    # get info from mask header
-    mask_header = fits.getheader(corr_mask_name)
-    mask_nx = mask_header['NAXIS1'] # xels
-    mask_ny = mask_header['NAXIS2'] # yels
-    mask_data = fits.getdata(corr_mask_name)
-    # define an initial pixel location by row,col
-    colc = np.random.randint(low=int(0.1*mask_nx),high=int(0.9*mask_nx))
-    rowc = np.random.randint(low=int(0.1*mask_ny),high=int(0.9*mask_ny))
-    # iterate until the pixel location does not overlap with existing source
-    while mask_data[rowc,colc]!=0:
-        colc = np.random.randint(low=int(0.1*mask_nx),high=int(0.9*mask_nx))
-        rowc = np.random.randint(low=int(0.1*mask_ny),high=int(0.9*mask_ny))
-    # get wcs mapping
-    w = WCS(corr_image_name)
-    # determine ra,dec to prevent image registration offsets in each band
-    ra,dec = w.all_pix2world(colc,rowc,1,ra_dec_order=True)
-    # clean up working directory
-    if os.access(corr_image_name,0):os.remove(corr_image_name)
-    if os.access(corr_mask_name,0):os.remove(corr_mask_name)
-    if os.access('test.cat',0):os.remove('test.cat')
-    return run,rerun,camcol,field,ra,dec
-
-def make_sdss_args(field_info):
-    run,rerun,camcol,field,ra,dec = rrcf_radec(field_info)
-    sdss_args = {
-                'sdss_run'      : run,   # sdss run
-                'sdss_rerun'    : rerun,    # sdss rerun
-                'sdss_camcol'   : camcol,     # sdss camcol
-                'sdss_field'    : field,   # sdss field
-                'sdss_ra'       : ra,  # ra for image centroid
-                'sdss_dec'      : dec,   # dec for image centroid
-                }
-    return sdss_args
+    # create argument list
+    argList = []
+    for inputName in inputList:
+        for image_i in range(fov_per_image):
+            outputName = inputName.replace('.fits','_FullReal-{}.fits'.format(image_i)).replace('Inputs/','Outputs/')
+            argList.append((inputName,outputName,common_args))
+    
+    pool.map(worker_wrapper, argList)
+    pool.close()
+    pool.join()
+    
+if __name__ == '__main__':
+    import time,tempfile
+    import multiprocessing as mp
+    main(fov_per_image=10)
