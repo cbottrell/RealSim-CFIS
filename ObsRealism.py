@@ -21,7 +21,7 @@ sep.set_extract_pixstack(9999999)
 from vos import vos
 
 # RealSimCFIS base directory (should be part of `self` if class)
-RSDIR = '/Users/cbottrell/Project/RealSimCFIS/'
+realsim_dir = os.path.dirname(os.path.abspath(__file__))
 
 def getInfo_SQL():
     '''Grab object and tile info from database.'''
@@ -47,7 +47,7 @@ def getInfo_SQL():
 
 def getInfo_File():
     '''Grab object and info from npy file.'''
-    catName = RSDIR+'/Sources/Catalogues/CFIS-DR7_fieldInfo.npy'
+    catName = f'{realsim_dir}/Sources/Catalogues/CFIS-DR7_fieldInfo.npy'
     objIDs,ras,decs,tiles = np.load(catName)
     objIDs = objIDs.astype(int)
     ras = ras.astype(float)
@@ -62,7 +62,7 @@ def genCFIS_argList(use_sql=False):
         objIDs,ras,decs,tiles = getInfo_File()
     return list(zip(ras,decs,tiles))
 
-def getCutoutImage(ra,dec,tile,hw=1750):
+def getCutoutImage(ra,dec,tile,hw=1750,dr='DR3'):
     '''Get a large cutout of CFIS tile. Input images are 10000x10000.
     This function makes an (11 arcmin x 11 arcmin) of the CFIS tile. 
     It finds the (row,col) position of the target objID using ra,dec (degrees).
@@ -70,14 +70,14 @@ def getCutoutImage(ra,dec,tile,hw=1750):
     The final cutout is 3501x3501 pixels, not always centered on the target.
     `hw` is the half-width of the cutout size. Returns cutout filename.'''
     warnings.filterwarnings('ignore')
-    client = vos.Client()
+   
     wcsName = 'WCS-{}'.format(tile)
     cutoutName = 'Cutout-{}'.format(tile)
     # get wcs file
     while not os.access(wcsName,0):
+        vos_cmd = f'vcp vos:cfis/tiles_{dr}/{tile}[1:2,1:2] {wcsName}'
         try:
-            client.copy(source='vos:cfis/tiles_DR2/{}[1:2,1:2]'.format(tile),
-                        destination=wcsName)
+            os.system(vos_cmd)
         except:
             time.sleep(10)
     # get wcs mapping
@@ -109,9 +109,9 @@ def getCutoutImage(ra,dec,tile,hw=1750):
         rowc_p = rowc+hw
     # get full file
     while not os.access(cutoutName,0):
+        vos_cmd = f'vcp vos:cfis/tiles_{dr}/{tile}[{colc_m}:{colc_p},{rowc_m}:{rowc_p}] {cutoutName}'
         try:
-            client.copy(source='vos:cfis/tiles_DR2/{}[{}:{},{}:{}]'.format(tile,colc_m,colc_p,rowc_m,rowc_p),
-                        destination=cutoutName)
+            os.system(vos_cmd)
         except:
             time.sleep(10)
     return cutoutName
@@ -120,7 +120,7 @@ def genSegmap(cutoutName):
     '''Create segmenation image using the sep SExtractor module.'''
     cutoutData = fits.getdata(cutoutName)
     # filter kernel
-    filter_kernel = np.loadtxt('{}Sources/utils/CFIS-cfg/gauss_3.0_7x7.conv'.format(RSDIR),skiprows=2)
+    filter_kernel = np.loadtxt(f'{realsim_dir}/Sources/utils/CFIS-cfg/gauss_3.0_7x7.conv',skiprows=2)
     # use std of full image as detection threshold
     guess_rms = np.std(cutoutData)
     # mask all sources above std for background statistics
@@ -373,7 +373,7 @@ def main(fov_per_image=1):
     SLURM_CPUS = mp.cpu_count()
     pool = mp.Pool(1)
     
-    inputList = list(sorted(glob('{}Inputs/photo_r_CFIS*.fits'.format(RSDIR))))
+    inputList = list(sorted(glob(f'{realsim_dir}/Inputs/photo_r_CFIS*.fits')))
 
     cosmo=FlatLambdaCDM(H0=70,Om0=0.3)
     common_args = { 
