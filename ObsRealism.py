@@ -7,7 +7,7 @@ The statistical observational realism suite presented in Bottrell et al 2019b ap
 import numpy as np
 import os,sys,string,time,random
 from rebin import rebin
-import scipy.interpolate
+from scipy.interpolate import RectBivariateSpline
 import scipy.ndimage
 import warnings
 from astropy.io import fits
@@ -228,7 +228,11 @@ def RealSim_CFIS(inputName,outputName,
         # axes of regridded image
         nPixelsNew = int(np.floor((arcsec_per_pixel/ccd_scale)*nPixelsOld))
         # rebin to new ccd scale
-        img_nanomaggies = rebin(img_nanomaggies,(nPixelsNew,nPixelsNew))
+        if nPixelsNew>nPixelsOld:
+            interp = RectBivariateSpline(np.linspace(-1,1,nPixelsOld),np.linspace(-1,1,nPixelsOld),img_nanomaggies,kx=1,ky=1)
+            img_nanomaggies = interp(np.linspace(-1,1,nPixelsNew),np.linspace(-1,1,nPixelsNew))*(nPixelsOld/nPixelsNew)**2
+        else:
+            img_nanomaggies = rebin(img_nanomaggies,(nPixelsNew,nPixelsNew))
         # new kpc_per_pixel on ccd
         kpc_per_pixel = kpc_per_arcsec * ccd_scale
         # new arcsec per pixel
